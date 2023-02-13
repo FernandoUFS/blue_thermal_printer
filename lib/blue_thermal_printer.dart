@@ -119,6 +119,10 @@ class BlueThermalPrinter {
   Future<dynamic> printImageBytes(Uint8List bytes) =>
       _channel.invokeMethod('printImageBytes', {'bytes': bytes});
 
+  /// Print an image to printers of Datecs: DPP
+  Future<dynamic> printImageDpp(String base64) =>
+    _channel.invokeMethod('printImageDpp', {'base64': base64});
+
   ///printQRcode(String textToQR, int width, int height, int align)
   Future<dynamic> printQRcode(
           String textToQR, int width, int height, int align) =>

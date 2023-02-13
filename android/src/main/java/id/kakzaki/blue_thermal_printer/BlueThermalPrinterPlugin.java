@@ -25,6 +25,9 @@ import android.os.AsyncTask;
 import android.os.Handler;
 import android.os.Looper;
 
+import com.datecs.api.printer.Printer;
+import com.datecs.api.printer.ProtocolAdapter;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -35,6 +38,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.Base64;
+import java.util.Set;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.embedding.engine.plugins.activity.ActivityAware;
@@ -62,6 +67,10 @@ public class BlueThermalPrinterPlugin implements FlutterPlugin, ActivityAware,Me
   private static final UUID MY_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
   private static ConnectedThread THREAD = null;
   private BluetoothAdapter mBluetoothAdapter;
+
+  public static final int ALIGN_LEFT = 0;
+  public static final int ALIGN_CENTER = 1;
+  public static final int ALIGN_RIGHT = 2;
 
   private Result pendingResult;
 
@@ -292,6 +301,7 @@ public class BlueThermalPrinterPlugin implements FlutterPlugin, ActivityAware,Me
         if (arguments.containsKey("message")) {
           byte[] message = (byte[]) arguments.get("message");
           writeBytes(result, message);
+          result.success(true);
         } else {
           result.error("invalid_argument", "argument 'message' not found", null);
         }
@@ -334,12 +344,50 @@ public class BlueThermalPrinterPlugin implements FlutterPlugin, ActivityAware,Me
         }
         break;
 
-        case "printImageBytes":
+      case "printImageBytes":
         if (arguments.containsKey("bytes")) {
           byte[] bytes = (byte[]) arguments.get("bytes");
           printImageBytes(result, bytes);
         } else {
           result.error("invalid_argument", "argument 'bytes' not found", null);
+        }
+        break;
+
+      case "printImageDpp":
+        if (arguments.containsKey("base64")) {
+          try {
+            String img = (String) arguments.get("base64");
+
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+              byte[] decodedString = Base64.getDecoder().decode(img.getBytes("UTF-8"));
+              Bitmap decodedByte = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.length);
+              //Bitmap resized = Bitmap.createScaledBitmap(decodedByte, 300, 300, true);
+              int width = decodedByte.getWidth();
+              int height = decodedByte.getHeight();
+              final int[] argb = new int[width * height];
+              decodedByte.getPixels(argb, 0, decodedByte.getWidth(), 0, 0, width, height);
+              decodedByte.recycle();
+
+              THREAD.printImageDpp(argb, width, height, ALIGN_CENTER, true);
+            } else {
+              byte[] decodedString = android.util.Base64.decode(img, android.util.Base64.DEFAULT);
+              Bitmap decodedByte = BitmapFactory.decodeByteArray(decodedString, 0, decodedString.length);
+              //Bitmap resized = Bitmap.createScaledBitmap(decodedByte, 300, 300, true);
+              int width = decodedByte.getWidth();
+              int height = decodedByte.getHeight();
+              final int[] argb = new int[width * height];
+              decodedByte.getPixels(argb, 0, decodedByte.getWidth(), 0, 0, width, height);
+              decodedByte.recycle();
+              THREAD.printImageDpp(argb, width, height, ALIGN_CENTER, true);
+            }
+            THREAD.flushDpp();
+            result.success(true);
+          } catch (Exception e){
+            Log.e(TAG, e.getMessage(), e);
+            result.error("error", e.getMessage(), null);
+          }
+        } else {
+          result.error("invalid_argument", "argument 'base64' not found", null);
         }
         break;
 
@@ -503,7 +551,6 @@ public class BlueThermalPrinterPlugin implements FlutterPlugin, ActivityAware,Me
    * @param address address
    */
   private void connect(Result result, String address) {
-
     if (THREAD != null) {
       result.error("connect_error", "already connected", null);
       return;
@@ -591,7 +638,22 @@ public class BlueThermalPrinterPlugin implements FlutterPlugin, ActivityAware,Me
 
     try {
       THREAD.write(message);
-      result.success(true);
+      //result.success(true);
+    } catch (Exception ex) {
+      Log.e(TAG, ex.getMessage(), ex);
+      result.error("write_error", ex.getMessage(), exceptionToString(ex));
+    }
+  }
+
+  private void writeBytes(Result result, byte[] message, int offset, int length) {
+    if (THREAD == null) {
+      result.error("write_error", "not connected", null);
+      return;
+    }
+
+    try {
+      THREAD.write(message, offset, length);
+      //result.success(true);
     } catch (Exception ex) {
       Log.e(TAG, ex.getMessage(), ex);
       result.error("write_error", ex.getMessage(), exceptionToString(ex));
@@ -878,6 +940,123 @@ public class BlueThermalPrinterPlugin implements FlutterPlugin, ActivityAware,Me
     }
   }
 
+  private static void convertARGBToGrayscale(int[] argb, int width, int height) {
+    int pixels = width * height;
+
+    for(int i = 0; i < pixels; ++i) {
+      int r = argb[i] >> 16 & 255;
+      int g = argb[i] >> 8 & 255;
+      int b = argb[i] & 255;
+      int color = r * 19 + g * 38 + b * 7 >> 6 & 255;
+      argb[i] = color;
+    }
+  }
+
+  private static void ditherImageByFloydSteinberg(int[] grayscale, int width, int height) {
+    int stopXM1 = width - 1;
+    int stopYM1 = height - 1;
+    int[] coef = new int[]{3, 5, 1};
+    int y = 0;
+
+    for(int offs = 0; y < height; ++y) {
+      for(int x = 0; x < width; ++offs) {
+        int v = grayscale[offs];
+        int error;
+        if (v < 128) {
+          grayscale[offs] = 0;
+          error = v;
+        } else {
+          grayscale[offs] = 255;
+          error = v - 255;
+        }
+
+        int ed;
+        if (x != stopXM1) {
+          ed = grayscale[offs + 1] + error * 7 / 16;
+          ed = ed < 0 ? 0 : (ed > 255 ? 255 : ed);
+          grayscale[offs + 1] = ed;
+        }
+
+        if (y != stopYM1) {
+          int i = -1;
+
+          for(int j = 0; i <= 1; ++j) {
+            if (x + i >= 0 && x + i < width) {
+              ed = grayscale[offs + width + i] + error * coef[j] / 16;
+              ed = ed < 0 ? 0 : (ed > 255 ? 255 : ed);
+              grayscale[offs + width + i] = ed;
+            }
+
+            ++i;
+          }
+        }
+
+        ++x;
+      }
+    }
+
+  }
+
+//  public void printImageDpp(Result result, int[] argb, int width, int height, int align, boolean dither)
+//          throws Exception {
+//    //byte[] buf = null;
+//    //int bufOffs = 0;
+//    if (argb == null) {
+//      throw new NullPointerException("The argb is null");
+//    } else if (align >= 0 && align <= 2) {
+//      if (width >= 1 && height >= 1) {
+//        convertARGBToGrayscale(argb, width, height);
+////        if (dither) {
+////          ditherImageByFloydSteinberg(argb, width, height);
+////        }
+//
+//        byte[] buf = new byte[width * 3 + 9];
+//        synchronized(this) {
+//          int bufOffs = 0;
+//          bufOffs = bufOffs + 1;
+//          buf[bufOffs] = 27;
+//          buf[bufOffs++] = 51;
+//          buf[bufOffs++] = 24;
+//          this.writeBytes(result, buf, 0, bufOffs);
+//          bufOffs = 0;
+//          bufOffs = bufOffs + 1;
+//          buf[bufOffs] = 27;
+//          buf[bufOffs++] = 97;
+//          buf[bufOffs++] = (byte)align;
+//          buf[bufOffs++] = 27;
+//          buf[bufOffs++] = 42;
+//          buf[bufOffs++] = 33;
+//          buf[bufOffs++] = (byte)(width % 256);
+//          buf[bufOffs++] = (byte)(width / 256);
+//          buf[buf.length - 1] = 10;
+//          int j = 0;
+//
+//          for(int offs = 0; j < height; ++j) {
+//            int i;
+//            if (j > 0 && j % 24 == 0) {
+//              this.writeBytes(result, buf);
+//
+//              for(i = bufOffs; i < buf.length - 1; ++i) {
+//                buf[i] = 0;
+//              }
+//            }
+//
+//            for(i = 0; i < width; ++offs) {
+//              buf[bufOffs + i * 3 + j % 24 / 8] |= (byte)((argb[offs] < 128 ? 1 : 0) << 7 - j % 8);
+//              ++i;
+//            }
+//          }
+//
+//          this.writeBytes(result, buf);
+//        }
+//      } else {
+//        throw new IllegalArgumentException("The size of image is illegal");
+//      }
+//    } else {
+//      throw new IllegalArgumentException("The align is illegal");
+//    }
+//  }
+
   private void printImageBytes(Result result, byte[] bytes) {
     if (THREAD == null) {
       result.error("write_error", "not connected", null);
@@ -940,6 +1119,8 @@ public class BlueThermalPrinterPlugin implements FlutterPlugin, ActivityAware,Me
     private final BluetoothSocket mmSocket;
     private final InputStream inputStream;
     private final OutputStream outputStream;
+    private Printer dpp;
+    private ProtocolAdapter mProtocolAdapter;
 
     ConnectedThread(BluetoothSocket socket) {
       mmSocket = socket;
@@ -954,6 +1135,50 @@ public class BlueThermalPrinterPlugin implements FlutterPlugin, ActivityAware,Me
       }
       inputStream = tmpIn;
       outputStream = tmpOut;
+
+      try {
+        initializePrinter(inputStream, outputStream);
+      } catch (Exception e){
+        Log.e(TAG, "And exception has ocurred when initializing dpp printer: " + e.getMessage());
+      }
+    }
+
+    protected void initializePrinter(InputStream inputStream, OutputStream outputStream) throws IOException {
+      mProtocolAdapter = new ProtocolAdapter(inputStream, outputStream);
+      if (mProtocolAdapter.isProtocolEnabled()) {
+        final ProtocolAdapter.Channel channel = mProtocolAdapter.getChannel(ProtocolAdapter.CHANNEL_PRINTER);
+
+        // Create new event pulling thread
+        new Thread(new Runnable() {
+          @Override
+          public void run() {
+            while (true) {
+              try {
+                Thread.sleep(50);
+              } catch (InterruptedException e) {
+              }
+              try {
+                channel.pullEvent();
+              } catch (IOException e) {
+
+                break;
+              }
+            }
+          }
+        }).start();
+        dpp = new Printer(channel.getInputStream(), channel.getOutputStream());
+      } else {
+        dpp = new Printer(mProtocolAdapter.getRawInputStream(), mProtocolAdapter.getRawOutputStream());
+      }
+
+    }
+
+    public void printImageDpp(int[] argb, int width, int height, int align, boolean dither) throws IOException {
+      dpp.printImage(argb, width, height, align, dither);
+    }
+
+    public void flushDpp() throws IOException {
+      dpp.flush();
     }
 
     public void run() {
@@ -974,6 +1199,14 @@ public class BlueThermalPrinterPlugin implements FlutterPlugin, ActivityAware,Me
     public void write(byte[] bytes) {
       try {
         outputStream.write(bytes);
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
+    }
+
+    public void write(byte[] bytes, int offset, int length) {
+      try {
+        outputStream.write(bytes, offset, length);
       } catch (IOException e) {
         e.printStackTrace();
       }
