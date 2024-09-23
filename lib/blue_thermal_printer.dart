@@ -173,8 +173,8 @@ class BlueThermalPrinter {
 }
 
 class BluetoothDevice {
-  final String? name;
-  final String? address;
+  final String name;
+  final String address;
   final int type = 0;
   bool connected = false;
 
